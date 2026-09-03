@@ -10,7 +10,7 @@
  * @see Requirements 3.1, 3.4, 3.5, 10.3, 13.3, 13.8
  */
 
-import https from 'https';
+import { Agent as UndiciAgent } from 'undici';
 import {
   SecretsManagerClient,
   GetSecretValueCommand,
@@ -107,15 +107,20 @@ const ALLOW_SELF_SIGNED_TLS =
   (process.env.OPENEMR_ALLOW_SELF_SIGNED_TLS || '').toLowerCase() === 'true';
 
 /**
- * Creates an HTTPS agent that enforces TLS 1.2+ for all connections.
- * When self-signed TLS is allowed, chain verification is disabled for the
- * internal OpenEMR ALB endpoint (see ALLOW_SELF_SIGNED_TLS).
+ * Creates an undici dispatcher that enforces TLS 1.2+ for all connections.
+ *
+ * IMPORTANT: Node's built-in fetch (undici) ignores the legacy `agent` option; a
+ * custom TLS configuration must be supplied via a `dispatcher`. Using an
+ * https.Agent here silently does nothing, which is why self-signed certs still
+ * caused "fetch failed" TypeErrors. When self-signed TLS is allowed, chain/host
+ * verification is disabled for the internal OpenEMR ALB endpoint.
  */
-function createTlsAgent(): https.Agent {
-  return new https.Agent({
-    minVersion: MIN_TLS_VERSION,
-    keepAlive: true,
-    rejectUnauthorized: !ALLOW_SELF_SIGNED_TLS,
+function createTlsDispatcher(): UndiciAgent {
+  return new UndiciAgent({
+    connect: {
+      minVersion: MIN_TLS_VERSION,
+      rejectUnauthorized: !ALLOW_SELF_SIGNED_TLS,
+    },
   });
 }
 
@@ -143,7 +148,7 @@ export class FHIRClient {
   private readonly fhirBaseUrl: string;
   private readonly region: string;
   private readonly secretName: string;
-  private readonly tlsAgent: https.Agent;
+  private readonly tlsDispatcher: UndiciAgent;
   private readonly fetchFn: typeof fetch;
 
   private cachedCredentials: FHIRClientCredentials | null = null;
@@ -156,7 +161,7 @@ export class FHIRClient {
     this.fhirBaseUrl = config.fhirBaseUrl.replace(/\/$/, '');
     this.region = config.region;
     this.secretName = config.secretName ?? DEFAULT_SECRET_NAME;
-    this.tlsAgent = createTlsAgent();
+    this.tlsDispatcher = createTlsDispatcher();
     this.fetchFn = config.fetchFn ?? fetch;
 
     if (config.credentials) {
@@ -333,8 +338,8 @@ export class FHIRClient {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body.toString(),
         signal: controller.signal,
-        // @ts-expect-error Node.js fetch supports the agent option for https (TLS enforcement / self-signed ALB cert)
-        agent: this.tlsAgent,
+        // @ts-expect-error Node's fetch (undici) honors dispatcher for custom TLS (self-signed ALB cert)
+        dispatcher: this.tlsDispatcher,
       });
 
       if (!response.ok) {
@@ -491,13 +496,11 @@ export class FHIRClient {
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      // Node.js fetch supports the dispatcher option for custom agents.
-      // We pass the TLS agent via a custom dispatcher for TLS enforcement.
+      // Node's fetch (undici) honors the `dispatcher` option for custom TLS config.
       const fetchOptions: RequestInit & { dispatcher?: unknown } = {
         ...options,
         signal: controller.signal,
-        // @ts-expect-error Node.js fetch supports agent option for https
-        agent: this.tlsAgent,
+        dispatcher: this.tlsDispatcher,
       };
 
       const response = await this.fetchFn(url, fetchOptions);
@@ -567,8 +570,8 @@ export class FHIRClient {
         },
         body: body.toString(),
         signal: controller.signal,
-        // @ts-expect-error Node.js fetch supports the agent option for https (TLS enforcement / self-signed ALB cert)
-        agent: this.tlsAgent,
+        // @ts-expect-error Node's fetch (undici) honors dispatcher for custom TLS (self-signed ALB cert)
+        dispatcher: this.tlsDispatcher,
       });
 
       if (!response.ok) {
@@ -591,7 +594,12 @@ export class FHIRClient {
           `OAuth2 token request timed out after ${REQUEST_TIMEOUT_MS / 1000} seconds`
         );
       }
-      console.log(`[FHIR] Token request ERROR: ${error instanceof Error ? error.name : 'Unknown'}`);
+      const cause = (error as { cause?: { code?: string; message?: string } })?.cause;
+      console.log(
+        `[FHIR] Token request ERROR: ${error instanceof Error ? error.name : 'Unknown'}` +
+          `${error instanceof Error ? ` - ${error.message}` : ''}` +
+          `${cause ? ` (cause: ${cause.code || cause.message})` : ''}`
+      );
       throw error;
     } finally {
       clearTimeout(timeoutId);

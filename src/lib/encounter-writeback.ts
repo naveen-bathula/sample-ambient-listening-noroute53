@@ -16,7 +16,7 @@
  * documentation and shared responsibility model for additional requirements.
  */
 
-import https from 'https';
+import { Agent as UndiciAgent } from 'undici';
 import {
   SecretsManagerClient,
   GetSecretValueCommand,
@@ -31,10 +31,12 @@ const FHIR_BASE_URL = process.env.OPENEMR_FHIR_BASE_URL || '';
 // internal service-to-service calls while still enforcing TLS 1.2+.
 const ALLOW_SELF_SIGNED_TLS =
   (process.env.OPENEMR_ALLOW_SELF_SIGNED_TLS || '').toLowerCase() === 'true';
-const tlsAgent = new https.Agent({
-  minVersion: 'TLSv1.2',
-  keepAlive: true,
-  rejectUnauthorized: !ALLOW_SELF_SIGNED_TLS,
+// Node's fetch (undici) ignores https.Agent; a dispatcher is required for custom TLS.
+const tlsDispatcher = new UndiciAgent({
+  connect: {
+    minVersion: 'TLSv1.2',
+    rejectUnauthorized: !ALLOW_SELF_SIGNED_TLS,
+  },
 });
 const FHIR_CREDENTIALS_SECRET = process.env.FHIR_CREDENTIALS_SECRET_NAME || 'DemoAppStack/fhir-api-credentials';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
@@ -132,8 +134,8 @@ async function getAccessToken(): Promise<string> {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
-    // @ts-expect-error Node.js fetch supports the agent option for https (self-signed ALB cert)
-    agent: tlsAgent,
+    // @ts-expect-error Node's fetch (undici) honors dispatcher for custom TLS (self-signed ALB cert)
+    dispatcher: tlsDispatcher,
   });
 
   if (!response.ok) {
@@ -177,8 +179,8 @@ export async function createEncounterWithNote(
       'Accept': 'application/json',
       'Authorization': `Bearer ${token}`,
     },
-    // @ts-expect-error Node.js fetch supports the agent option for https (self-signed ALB cert)
-    agent: tlsAgent,
+    // @ts-expect-error Node's fetch (undici) honors dispatcher for custom TLS (self-signed ALB cert)
+    dispatcher: tlsDispatcher,
     body: JSON.stringify({
       date: dateStr,
       reason: 'Ambient Clinical Documentation',
