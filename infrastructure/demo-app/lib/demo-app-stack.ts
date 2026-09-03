@@ -6,10 +6,7 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as route53 from 'aws-cdk-lib/aws-route53';
-import * as route53Targets from 'aws-cdk-lib/aws-route53-targets';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
-import * as elbv2Actions from 'aws-cdk-lib/aws-elasticloadbalancingv2-actions';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
@@ -515,7 +512,7 @@ export class DemoAppStack extends cdk.Stack {
       executionRole: this.ecsTaskExecutionRole,
     });
 
-    this.taskDefinition.addContainer('DemoAppContainer', {
+    const appContainer = this.taskDefinition.addContainer('DemoAppContainer', {
       image: ecs.ContainerImage.fromAsset('../../', {
         file: 'Dockerfile',
         exclude: ['infrastructure', '.git', 'node_modules', '.next'],
@@ -535,6 +532,9 @@ export class DemoAppStack extends cdk.Stack {
         CONNECT_HEALTH_DOMAIN_NAME: connectHealthDomainName,
         FHIR_CREDENTIALS_SECRET_NAME: this.fhirApiCredentials.secretName,
         DB_SECRET_ARN: ssm.StringParameter.valueForStringParameter(this, `/${openemrStackName}/DatabaseSecretArn`),
+        // The OpenEMR ALB is fronted by a self-signed certificate (no Route53/ACM DNS-validated cert).
+        // Allow the demo app's server-side calls to trust it while still enforcing TLS 1.2+.
+        OPENEMR_ALLOW_SELF_SIGNED_TLS: 'true',
       },
       secrets: {
         DB_CREDENTIALS: ecs.Secret.fromSecretsManager(this.dbCredentials),
@@ -604,14 +604,27 @@ export class DemoAppStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // Determine the callback URL based on domain
-    const domainName = props.domain ?? this.node.tryGetContext('domain');
-    const ambientDomain = domainName
-      ? (domainName.startsWith('ambient.') ? domainName : `ambient.${domainName}`)
-      : null;
-    const callbackUrl = ambientDomain
-      ? `https://${ambientDomain}/oauth2/idpresponse`
-      : `https://${this.alb.loadBalancerDnsName}/oauth2/idpresponse`;
+    // Authentication is handled inside the Next.js application (app-level OIDC),
+    // not by the ALB. The callback is the app's own same-origin route, and the
+    // logout target is the app root. Using the ALB DNS name directly (no Route53).
+    const appBaseUrl = `https://${this.alb.loadBalancerDnsName}`;
+    const callbackUrl = `${appBaseUrl}/api/auth/callback`;
+
+    // Cognito hosted UI domain.
+    // The domain prefix must be globally unique across all AWS accounts, so we append
+    // the account ID to avoid collisions with other deployments of this sample.
+    //
+    // NOTE: The domain MUST exist before the user pool client is created. Cognito only
+    // allows a client to enable OAuth 2.0 flows (AllowedOAuthFlowsUserPoolClient=true)
+    // once the user pool has a hosted-UI domain associated. Creating the client first
+    // leaves OAuth flows disabled and the hosted UI reports
+    // "Client is not enabled for OAuth2.0 flows." We therefore declare the domain first
+    // and add an explicit dependency below.
+    const cognitoDomain = userPool.addDomain('DemoAppCognitoDomain', {
+      cognitoDomain: {
+        domainPrefix: `${id.toLowerCase()}-auth-${cdk.Aws.ACCOUNT_ID}`,
+      },
+    });
 
     const userPoolClient = userPool.addClient('DemoAppClient', {
       userPoolClientName: `${id}-alb-client`,
@@ -620,19 +633,37 @@ export class DemoAppStack extends cdk.Stack {
         flows: { authorizationCodeGrant: true },
         scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL, cognito.OAuthScope.PROFILE],
         callbackUrls: [callbackUrl],
-        logoutUrls: [domainName ? `https://ambient.${domainName}` : `https://${this.alb.loadBalancerDnsName}`],
+        logoutUrls: [`${appBaseUrl}/`],
       },
       supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
     });
 
-    // Cognito hosted UI domain.
-    // The domain prefix must be globally unique across all AWS accounts, so we append
-    // the account ID to avoid collisions with other deployments of this sample.
-    const cognitoDomain = userPool.addDomain('DemoAppCognitoDomain', {
-      cognitoDomain: {
-        domainPrefix: `${id.toLowerCase()}-auth-${cdk.Aws.ACCOUNT_ID}`,
-      },
+    // Ensure the hosted-UI domain is created before the client so OAuth flows enable correctly.
+    userPoolClient.node.addDependency(cognitoDomain);
+
+    // Store the Cognito app client secret in Secrets Manager so it can be injected
+    // into the ECS task as a secret (not a plaintext environment variable).
+    const cognitoClientSecret = new secretsmanager.Secret(this, 'CognitoClientSecret', {
+      secretName: `${id}/cognito-client-secret`,
+      description: 'Cognito app client secret for app-level OIDC authentication',
+      encryptionKey: secretsKey,
+      secretStringValue: userPoolClient.userPoolClientSecret,
     });
+
+    // --- Wire Cognito config into the app container (app-level OIDC auth) ---
+    // The app performs the OAuth2 authorization-code flow itself, so it needs the
+    // user pool id, client id, hosted-UI domain, app base URL, and the client secret.
+    appContainer.addEnvironment('COGNITO_USER_POOL_ID', userPool.userPoolId);
+    appContainer.addEnvironment('COGNITO_CLIENT_ID', userPoolClient.userPoolClientId);
+    appContainer.addEnvironment(
+      'COGNITO_DOMAIN',
+      `${cognitoDomain.domainName}.auth.${cdk.Aws.REGION}.amazoncognito.com`
+    );
+    appContainer.addEnvironment('APP_BASE_URL', appBaseUrl);
+    appContainer.addSecret(
+      'COGNITO_CLIENT_SECRET',
+      ecs.Secret.fromSecretsManager(cognitoClientSecret)
+    );
 
     // Create a default demo clinician user with a generated password stored in Secrets Manager
     const clinicianCredentials = new secretsmanager.Secret(this, 'ClinicianCredentials', {
@@ -712,37 +743,28 @@ exports.handler = async (event) => {
       },
     });
 
-    // ALB listener with Cognito authentication action
-    httpsListener.addAction('CognitoAuth', {
-      priority: 1,
-      conditions: [elbv2.ListenerCondition.pathPatterns(['/*'])],
-      action: new elbv2Actions.AuthenticateCognitoAction({
-        userPool,
-        userPoolClient,
-        userPoolDomain: cognitoDomain,
-        next: elbv2.ListenerAction.forward([
-          httpsListener.addTargets('DemoAppTargetGroup', {
-            port: 3000,
-            protocol: elbv2.ApplicationProtocol.HTTP,
-            targets: [this.ecsService],
-            healthCheck: {
-              path: '/',
-              interval: cdk.Duration.seconds(30),
-              timeout: cdk.Duration.seconds(5),
-              healthyThresholdCount: 2,
-              unhealthyThresholdCount: 3,
-            },
-          }),
-        ]),
-      }),
-    });
-
-    // Default action (deny unauthenticated)
-    httpsListener.addAction('DefaultDeny', {
-      action: elbv2.ListenerAction.fixedResponse(401, {
-        contentType: 'text/plain',
-        messageBody: 'Unauthorized',
-      }),
+    // ALB forwards all traffic directly to the app. Authentication is enforced
+    // inside the Next.js application (app-level Cognito OIDC via middleware), NOT
+    // by the ALB. The ALB authenticate-cognito action was removed because its
+    // cross-domain session-cookie/nonce round-trip fails when the app is served
+    // from a raw ALB DNS name with a self-signed certificate (no shared parent
+    // domain / no Route53).
+    httpsListener.addTargets('DemoAppTargetGroup', {
+      port: 3000,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targets: [this.ecsService],
+      healthCheck: {
+        // Lightweight liveness probe (public in the app middleware). It only reflects
+        // that the container is up, so transient FHIR/OpenEMR backend issues do not
+        // cause the ALB to kill otherwise-healthy tasks. The deep /api/health check
+        // (which verifies FHIR connectivity) remains available for the UI.
+        path: '/api/health/live',
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(5),
+        healthyThresholdCount: 2,
+        unhealthyThresholdCount: 3,
+        healthyHttpCodes: '200',
+      },
     });
 
     // Stack outputs for Cognito
@@ -751,9 +773,11 @@ exports.handler = async (event) => {
       description: 'Cognito User Pool ID',
     });
 
-    new cdk.CfnOutput(this, 'CognitoLoginUrl', {
-      value: `https://${cognitoDomain.domainName}.auth.${cdk.Aws.REGION}.amazoncognito.com/login?client_id=${userPoolClient.userPoolClientId}&response_type=code&scope=openid+email+profile&redirect_uri=${encodeURIComponent(callbackUrl)}`,
-      description: 'Cognito hosted UI login URL',
+    // Authentication is handled by the app: just open the app root and the app
+    // middleware redirects unauthenticated users into the Cognito login flow.
+    new cdk.CfnOutput(this, 'AppLoginUrl', {
+      value: appBaseUrl,
+      description: 'Open this URL to access the app; it redirects to Cognito login automatically',
     });
 
     new cdk.CfnOutput(this, 'DemoClinicianUserInfo', {
@@ -828,24 +852,8 @@ exports.handler = async (event) => {
     });
 
     // --- Route53 DNS Records ---
-    if (domainName) {
-      // The domainName may be the full subdomain (e.g., "ambient.hda.example.com") or
-      // the parent zone (e.g., "hda.example.com"). Strip the "ambient." prefix for zone lookup.
-      const zoneDomain = domainName.replace(/^ambient\./, '');
-      const hostedZone = route53.HostedZone.fromLookup(this, 'HostedZone', {
-        domainName: zoneDomain,
-      });
-
-      // Create A record for ambient.<zone> pointing to the ALB
-      const recordName = domainName.startsWith('ambient.') ? domainName : `ambient.${domainName}`;
-      new route53.ARecord(this, 'DemoAppAliasRecord', {
-        zone: hostedZone,
-        recordName,
-        target: route53.RecordTarget.fromAlias(
-          new route53Targets.LoadBalancerTarget(this.alb)
-        ),
-      });
-    }
+    // Route53 DNS records removed — using ALB DNS name directly with self-signed certificate.
+    // Access the app via the ALB DNS: https://<alb-dns-name>
 
     // --- Data Loader (Custom Resource) ---
     // Loads synthetic patient data into OpenEMR database during deployment.
@@ -1060,11 +1068,48 @@ exports.handler = async (event) => {
         `/${id}/DbCredentials/Resource`,
         `/${id}/FhirApiCredentials/Resource`,
         `/${id}/OpenemrAdminCredentials/Resource`,
+        `/${id}/CognitoClientSecret/Resource`,
       ],
       [
         {
           id: 'HIPAA.Security-SecretsManagerRotationEnabled',
           reason: 'Demo application generates secrets with strong passwords. Automatic rotation requires a rotation Lambda with database/service connectivity which is out of scope for the demo. Production deployments must enable rotation.',
+        },
+      ]
+    );
+
+    // The user pool client secret is retrieved via a CDK-generated DescribeUserPoolClient
+    // custom resource (needed to inject the confidential client secret into the app for
+    // app-level OIDC). CDK generates an inline policy for its role.
+    NagSuppressions.addResourceSuppressionsByPath(
+      this,
+      `/${id}/DemoAppUserPool/DemoAppClient/DescribeCognitoUserPoolClient/CustomResourcePolicy/Resource`,
+      [
+        {
+          id: 'HIPAA.Security-IAMNoInlinePolicy',
+          reason: 'CDK auto-generates an inline policy for the DescribeUserPoolClient custom resource used to read the app client secret. This is framework-generated and scoped to the single describe action.',
+        },
+      ]
+    );
+
+    // CDK singleton framework Lambda backing the DescribeUserPoolClient custom resource.
+    // It runs only at deploy time to read the app client secret; DLQ/VPC/concurrency
+    // controls are not applicable to this framework-managed, deploy-time-only function.
+    NagSuppressions.addResourceSuppressionsByPath(
+      this,
+      `/${id}/AWS679f53fac002430cb0da5b7982bd2287/Resource`,
+      [
+        {
+          id: 'HIPAA.Security-LambdaConcurrency',
+          reason: 'CDK framework custom-resource Lambda (deploy-time only). Concurrency limits not applicable.',
+        },
+        {
+          id: 'HIPAA.Security-LambdaDLQ',
+          reason: 'CDK framework custom-resource Lambda (deploy-time only). No DLQ needed for a synchronous deploy-time describe call.',
+        },
+        {
+          id: 'HIPAA.Security-LambdaInsideVPC',
+          reason: 'CDK framework custom-resource Lambda (deploy-time only) calls the public Cognito API; VPC placement is unnecessary.',
         },
       ]
     );

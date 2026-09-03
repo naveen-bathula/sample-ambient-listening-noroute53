@@ -6,33 +6,25 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Usage:
-#   ./destroy.sh --domain <route53-domain> [--region REGION]
+#   ./destroy.sh [--region REGION]
 #
 # Destroys all deployed resources to stop incurring costs.
-# Optionally cleans up the ACM certificate created during deployment.
+# Cleans up the self-signed ACM certificate created during deployment.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 REGION="us-east-1"
-DOMAIN=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --domain) DOMAIN="$2"; shift 2 ;;
     --region) REGION="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: ./destroy.sh --domain <route53-domain> [--region REGION]"
+      echo "Usage: ./destroy.sh [--region REGION]"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
-
-if [[ -z "$DOMAIN" ]]; then
-  echo "ERROR: --domain is required"
-  echo "Usage: ./destroy.sh --domain <route53-domain> [--region REGION]"
-  exit 1
-fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -112,7 +104,6 @@ log "Destroying both stacks in parallel..."
     --context "allowedCidr=0.0.0.0/32" \
     --context "openemrStackName=OpenEmrStack" \
     --context "certificateArn=arn:aws:acm:us-east-1:000000000000:certificate/dummy" \
-    --context "domain=ambient.${DOMAIN}" \
     >/dev/null 2>&1
   # If CDK destroy failed (S3 race — ALB writes logs during teardown), empty and retry
   if aws cloudformation describe-stacks --stack-name DemoAppStack --region "$REGION" --query 'Stacks[0].StackStatus' --output text 2>/dev/null | grep -q "FAILED"; then
@@ -140,7 +131,6 @@ DEMO_PID=$!
   pip install -r requirements.txt --quiet 2>/dev/null || true
   cdk destroy --force \
     --context "certificate_arn=arn:aws:acm:us-east-1:000000000000:certificate/dummy-for-destroy" \
-    --context "route53_domain=${DOMAIN}" \
     --context "security_group_ip_range_ipv4=127.0.0.1/32" \
     --context "activate_openemr_apis=true" \
     --context "rds_deletion_protection=false" \
@@ -172,101 +162,42 @@ wait $OPENEMR_PID && ok "OpenEMR stack destroyed" || warn "OpenEMR stack destroy
 
 cd "$SCRIPT_DIR"
 
-# ─── Clean Up SSM Parameters ──────────────────────────────────────────────────
+# ─── Clean Up SSM Parameters ────────────────────────────────────────────────
 
 log "Cleaning up SSM parameters..."
-for PARAM in "/OpenEmrStack/FhirApiBaseUrl" "/OpenEmrStack/CredentialsSecretArn" "/OpenEmrStack/DatabaseSecretArn" "/OpenEmrStack/WebConsoleUrl"; do
+for PARAM in "/OpenEmrStack/FhirApiBaseUrl" "/OpenEmrStack/CredentialsSecretArn" "/OpenEmrStack/DatabaseSecretArn" "/OpenEmrStack/WebConsoleUrl" "/OpenEmrStack/KmsKeyArn"; do
   aws ssm delete-parameter --name "$PARAM" --region "$REGION" 2>/dev/null || true
 done
 ok "SSM parameters cleaned up"
 
-# ─── Clean Up Route53 A Records ──────────────────────────────────────────────
+# ─── Clean Up Self-Signed ACM Certificate ────────────────────────────────────
 
-log "Cleaning up Route53 A records..."
-HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-  --dns-name "$DOMAIN" \
-  --query "HostedZones[?Name=='${DOMAIN}.'].Id" \
-  --output text 2>/dev/null | head -1 | sed 's|/hostedzone/||') || true
+log "Cleaning up self-signed ACM certificates..."
+SELF_SIGNED_CERTS=$(aws acm list-certificates --region "$REGION" \
+  --includes keyTypes=RSA_2048 \
+  --query "CertificateSummaryList[?DomainName=='*.elb.amazonaws.com' && Type=='IMPORTED'].CertificateArn" \
+  --output text 2>/dev/null) || true
 
-if [[ -n "$HOSTED_ZONE_ID" && "$HOSTED_ZONE_ID" != "None" ]]; then
-  # Delete openemr.domain and ambient.domain A records
-  for SUBDOMAIN in "openemr.${DOMAIN}" "ambient.${DOMAIN}"; do
-    RECORD=$(aws route53 list-resource-record-sets \
-      --hosted-zone-id "$HOSTED_ZONE_ID" \
-      --query "ResourceRecordSets[?Name=='${SUBDOMAIN}.' && Type=='A']" \
-      --output json 2>/dev/null)
-    
-    if echo "$RECORD" | python3 -c "import sys,json; r=json.load(sys.stdin); exit(0 if r else 1)" 2>/dev/null; then
-      ALIAS_DNS=$(echo "$RECORD" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r[0]['AliasTarget']['DNSName'])" 2>/dev/null) || true
-      ALIAS_ZONE=$(echo "$RECORD" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r[0]['AliasTarget']['HostedZoneId'])" 2>/dev/null) || true
-      
-      if [[ -n "$ALIAS_DNS" && -n "$ALIAS_ZONE" ]]; then
-        aws route53 change-resource-record-sets \
-          --hosted-zone-id "$HOSTED_ZONE_ID" \
-          --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":{\"Name\":\"${SUBDOMAIN}\",\"Type\":\"A\",\"AliasTarget\":{\"HostedZoneId\":\"${ALIAS_ZONE}\",\"DNSName\":\"${ALIAS_DNS}\",\"EvaluateTargetHealth\":false}}}]}" \
-          --output text >/dev/null 2>&1 && ok "Deleted A record: ${SUBDOMAIN}" || true
-      fi
+if [[ -n "$SELF_SIGNED_CERTS" && "$SELF_SIGNED_CERTS" != "None" ]]; then
+  for CERT in $SELF_SIGNED_CERTS; do
+    # Check if cert is still in use
+    IN_USE=$(aws acm describe-certificate \
+      --certificate-arn "$CERT" \
+      --region "$REGION" \
+      --query 'Certificate.InUseBy' \
+      --output text 2>/dev/null) || true
+    if [[ -z "$IN_USE" || "$IN_USE" == "None" ]]; then
+      aws acm delete-certificate --certificate-arn "$CERT" --region "$REGION" 2>/dev/null || true
+      ok "Deleted self-signed certificate: $CERT"
+    else
+      warn "Certificate still in use, skipping: $CERT"
     fi
   done
-fi
-
-# ─── Clean Up ACM Certificate ────────────────────────────────────────────────
-
-WILDCARD_DOMAIN="*.${DOMAIN}"
-log "Checking for ACM certificate to clean up..."
-
-CERT_ARN=$(aws acm list-certificates \
-  --region "$REGION" \
-  --query "CertificateSummaryList[?DomainName=='${WILDCARD_DOMAIN}'].CertificateArn" \
-  --output text 2>/dev/null | head -1) || true
-
-if [[ -n "$CERT_ARN" && "$CERT_ARN" != "None" ]]; then
-  # Check if cert is still in use
-  IN_USE=$(aws acm describe-certificate \
-    --certificate-arn "$CERT_ARN" \
-    --region "$REGION" \
-    --query 'Certificate.InUseBy' \
-    --output text 2>/dev/null) || true
-
-  if [[ -z "$IN_USE" || "$IN_USE" == "None" ]]; then
-    aws acm delete-certificate --certificate-arn "$CERT_ARN" --region "$REGION" 2>/dev/null || true
-    ok "ACM certificate deleted: $CERT_ARN"
-  else
-    warn "Certificate still in use, skipping deletion: $CERT_ARN"
-  fi
 else
-  ok "No ACM certificate found to clean up"
+  ok "No self-signed certificates found to clean up"
 fi
 
-# ─── Clean Up Route53 Validation Records ──────────────────────────────────────
-
-HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-  --dns-name "$DOMAIN" \
-  --query "HostedZones[?Name=='${DOMAIN}.'].Id" \
-  --output text 2>/dev/null | head -1 | sed 's|/hostedzone/||') || true
-
-if [[ -n "$HOSTED_ZONE_ID" && "$HOSTED_ZONE_ID" != "None" ]]; then
-  # Clean up any _acme-challenge CNAME records left by ACM validation
-  VALIDATION_RECORDS=$(aws route53 list-resource-record-sets \
-    --hosted-zone-id "$HOSTED_ZONE_ID" \
-    --query "ResourceRecordSets[?Type=='CNAME' && starts_with(Name, '_')].[Name,ResourceRecords[0].Value]" \
-    --output text 2>/dev/null) || true
-
-  if [[ -n "$VALIDATION_RECORDS" ]]; then
-    log "Cleaning up DNS validation records..."
-    while IFS=$'\t' read -r name value; do
-      if [[ -n "$name" && -n "$value" ]]; then
-        aws route53 change-resource-record-sets \
-          --hosted-zone-id "$HOSTED_ZONE_ID" \
-          --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":{\"Name\":\"${name}\",\"Type\":\"CNAME\",\"TTL\":300,\"ResourceRecords\":[{\"Value\":\"${value}\"}]}}]}" \
-          --output text >/dev/null 2>&1 || true
-      fi
-    done <<< "$VALIDATION_RECORDS"
-    ok "DNS validation records cleaned up"
-  fi
-fi
-
-# ─── Verify ───────────────────────────────────────────────────────────────────
+# ─── Verify ─────────────────────────────────────────────────────────────────
 
 echo ""
 log "Verifying cleanup..."

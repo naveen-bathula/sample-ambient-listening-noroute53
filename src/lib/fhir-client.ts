@@ -91,12 +91,31 @@ const DEFAULT_SECRET_NAME = process.env.FHIR_CREDENTIALS_SECRET_NAME || 'openemr
 // ─── HTTPS Agent ─────────────────────────────────────────────────────────────
 
 /**
+ * Whether to accept the OpenEMR ALB's self-signed certificate.
+ *
+ * This deployment fronts OpenEMR with an ALB that uses a self-signed certificate
+ * (no Route53 / ACM DNS-validated cert). Node's default TLS verification rejects
+ * self-signed certs with UNABLE_TO_VERIFY_LEAF_SIGNATURE / SELF_SIGNED_CERT_IN_CHAIN,
+ * which causes every server-side FHIR and OAuth token call to fail. When
+ * OPENEMR_ALLOW_SELF_SIGNED_TLS is set, we relax certificate chain verification for
+ * these internal service-to-service calls while still enforcing TLS 1.2+.
+ *
+ * TLS 1.2+ is still enforced; only chain/hostname verification is relaxed, and only
+ * for the demo app's calls to the internal OpenEMR ALB.
+ */
+const ALLOW_SELF_SIGNED_TLS =
+  (process.env.OPENEMR_ALLOW_SELF_SIGNED_TLS || '').toLowerCase() === 'true';
+
+/**
  * Creates an HTTPS agent that enforces TLS 1.2+ for all connections.
+ * When self-signed TLS is allowed, chain verification is disabled for the
+ * internal OpenEMR ALB endpoint (see ALLOW_SELF_SIGNED_TLS).
  */
 function createTlsAgent(): https.Agent {
   return new https.Agent({
     minVersion: MIN_TLS_VERSION,
     keepAlive: true,
+    rejectUnauthorized: !ALLOW_SELF_SIGNED_TLS,
   });
 }
 
@@ -314,6 +333,8 @@ export class FHIRClient {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body.toString(),
         signal: controller.signal,
+        // @ts-expect-error Node.js fetch supports the agent option for https (TLS enforcement / self-signed ALB cert)
+        agent: this.tlsAgent,
       });
 
       if (!response.ok) {
@@ -354,6 +375,43 @@ export class FHIRClient {
     ]);
 
     return { patient, conditions, medications, allergies };
+  }
+
+  /**
+   * POSTs a FHIR resource to the given path (e.g. '/DocumentReference').
+   * Sends an authenticated request through the TLS agent, so it works with the
+   * self-signed OpenEMR ALB certificate. Returns the created resource on success.
+   */
+  async postResource<T = unknown>(
+    path: string,
+    resource: unknown
+  ): Promise<FHIRFetchResult<T>> {
+    try {
+      const headers = await this.buildHeaders(true);
+      const url = `${this.fhirBaseUrl}${path}`;
+
+      const response = await this.fetchWithTimeout(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(resource),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        return {
+          success: false,
+          error: `FHIR write failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`,
+        };
+      }
+
+      const data = (await response.json().catch(() => ({}))) as T;
+      return { success: true, data };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
   }
 
   // ─── Private Methods ─────────────────────────────────────────────────────
@@ -509,6 +567,8 @@ export class FHIRClient {
         },
         body: body.toString(),
         signal: controller.signal,
+        // @ts-expect-error Node.js fetch supports the agent option for https (TLS enforcement / self-signed ALB cert)
+        agent: this.tlsAgent,
       });
 
       if (!response.ok) {

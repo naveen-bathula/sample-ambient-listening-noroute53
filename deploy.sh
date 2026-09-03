@@ -6,19 +6,19 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Usage:
-#   ./deploy.sh --domain <route53-domain> [--region REGION] [--skip-openemr] [--skip-data-load]
+#   ./deploy.sh --connect-health-domain <name> [--region REGION] [--skip-openemr] [--skip-data-load]
 #
 # Example:
-#   ./deploy.sh --domain <your-route53-domain> --connect-health-domain <your-domain-name>
+#   ./deploy.sh --connect-health-domain <your-domain-name>
 #
 # Prerequisites:
 #   - AWS CLI configured with credentials
 #   - Node.js 20+, npm 10+, Python 3.9+, AWS CDK CLI 2.150+
-#   - A Route53 hosted zone for the provided domain
 #   - Docker (for CDK asset bundling)
+#   - openssl (for self-signed certificate generation)
 #
 # This script:
-#   1. Creates an ACM certificate for the domain (DNS-validated via Route53)
+#   1. Creates a self-signed certificate and imports it to ACM
 #   2. Deploys OpenEMR on ECS Fargate (FHIR R4 API)
 #   3. Deploys the Demo Application on ECS Fargate (Next.js + Connect Health)
 #   4. Loads synthetic patient data (optional)
@@ -44,13 +44,13 @@ while [[ $# -gt 0 ]]; do
     --skip-openemr) SKIP_OPENEMR=true; shift ;;
     --skip-data-load) SKIP_DATA_LOAD=true; shift ;;
     -h|--help)
-      echo "Usage: ./deploy.sh --domain <route53-domain> --connect-health-domain <name> [--region REGION] [--skip-openemr] [--skip-data-load]"
+      echo "Usage: ./deploy.sh --connect-health-domain <name> [--region REGION] [--skip-openemr] [--skip-data-load]"
       echo ""
       echo "Required:"
-      echo "  --domain DOMAIN                   Route53 hosted zone domain (e.g., hda.example.people.aws.dev)"
       echo "  --connect-health-domain NAME      Amazon Connect Health domain name (created via console)"
       echo ""
       echo "Options:"
+      echo "  --domain DOMAIN     Optional label (not used for DNS)"
       echo "  --region REGION     AWS region (default: us-east-1, must be us-east-1 or us-west-2)"
       echo "  --skip-openemr      Skip OpenEMR stack deployment (if already deployed)"
       echo "  --skip-data-load    Skip synthetic patient data loading"
@@ -83,11 +83,10 @@ echo ""
 
 log "Running preflight checks..."
 
-# Validate domain is provided
-if [[ -z "$DOMAIN" ]]; then
-  fail "Domain is required. Usage: ./deploy.sh --domain <route53-domain> --connect-health-domain <name>"
+# Domain is optional (used for labeling only, not for DNS)
+if [[ -n "$DOMAIN" ]]; then
+  ok "Domain label: $DOMAIN (informational only, no Route53 required)"
 fi
-ok "Domain: $DOMAIN"
 
 # Validate Connect Health domain is provided
 if [[ -z "$CONNECT_HEALTH_DOMAIN" ]]; then
@@ -106,6 +105,7 @@ command -v aws >/dev/null 2>&1 || fail "AWS CLI not found. Install: https://docs
 command -v node >/dev/null 2>&1 || fail "Node.js not found. Install: https://nodejs.org/"
 command -v cdk >/dev/null 2>&1 || fail "AWS CDK CLI not found. Install: npm install -g aws-cdk@2.150.0"
 command -v python3 >/dev/null 2>&1 || fail "Python 3 not found. Install: https://www.python.org/downloads/"
+command -v openssl >/dev/null 2>&1 || fail "openssl not found. Required for self-signed certificate generation."
 ok "Required CLI tools found"
 
 # Check Node.js version
@@ -124,17 +124,6 @@ MY_IP=$(curl -s --max-time 5 https://checkip.amazonaws.com 2>/dev/null) || fail 
 MY_CIDR="${MY_IP%.*}.0/24"
 ok "Your IP: $MY_IP (allowing ${MY_CIDR})"
 
-# Verify Route53 hosted zone exists
-HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name \
-  --dns-name "$DOMAIN" \
-  --query "HostedZones[?Name=='${DOMAIN}.'].Id" \
-  --output text 2>/dev/null | head -1 | sed 's|/hostedzone/||') || true
-
-if [[ -z "$HOSTED_ZONE_ID" || "$HOSTED_ZONE_ID" == "None" ]]; then
-  fail "Route53 hosted zone not found for domain: $DOMAIN. Create one first."
-fi
-ok "Route53 hosted zone: $HOSTED_ZONE_ID"
-
 # Check CDK bootstrap
 aws cloudformation describe-stacks --stack-name CDKToolkit --region "$REGION" --query 'Stacks[0].StackStatus' --output text >/dev/null 2>&1 || {
   log "CDK not bootstrapped in $REGION. Bootstrapping now..."
@@ -147,101 +136,46 @@ echo ""
 log "Preflight checks passed. Starting deployment..."
 echo ""
 
-# ─── Create ACM Certificate ──────────────────────────────────────────────────
+# ─── Create Self-Signed Certificate ─────────────────────────────────────────────
 
-OPENEMR_DOMAIN="openemr.${DOMAIN}"
-DEMO_DOMAIN="ambient.${DOMAIN}"
-WILDCARD_DOMAIN="*.${DOMAIN}"
+log "Creating self-signed certificate for ALB HTTPS..."
 
-log "Checking for existing ACM certificate..."
+CERT_DIR="$SCRIPT_DIR/.certs"
+mkdir -p "$CERT_DIR"
 
-# Look for an existing wildcard or matching certificate
+# Check for existing self-signed cert in ACM (avoid duplicates)
 EXISTING_CERT_ARN=$(aws acm list-certificates \
   --region "$REGION" \
-  --query "CertificateSummaryList[?DomainName=='${WILDCARD_DOMAIN}' && Status=='ISSUED'].CertificateArn" \
+  --includes keyTypes=RSA_2048 \
+  --query "CertificateSummaryList[?DomainName=='*.elb.amazonaws.com' && Type=='IMPORTED'].CertificateArn" \
   --output text 2>/dev/null | head -1) || true
 
-if [[ -z "$EXISTING_CERT_ARN" || "$EXISTING_CERT_ARN" == "None" ]]; then
-  # Try exact domain match
-  EXISTING_CERT_ARN=$(aws acm list-certificates \
-    --region "$REGION" \
-    --query "CertificateSummaryList[?DomainName=='${OPENEMR_DOMAIN}' && Status=='ISSUED'].CertificateArn" \
-    --output text 2>/dev/null | head -1) || true
-fi
-
 if [[ -n "$EXISTING_CERT_ARN" && "$EXISTING_CERT_ARN" != "None" ]]; then
-  ok "Using existing certificate: $EXISTING_CERT_ARN"
+  ok "Using existing self-signed certificate: $EXISTING_CERT_ARN"
   CERT_ARN="$EXISTING_CERT_ARN"
 else
-  log "Creating ACM certificate for *.${DOMAIN}..."
+  # Generate a self-signed certificate (valid for 365 days)
+  openssl req -x509 -nodes -days 365 \
+    -newkey rsa:2048 \
+    -keyout "$CERT_DIR/selfsigned.key" \
+    -out "$CERT_DIR/selfsigned.crt" \
+    -subj "/CN=*.elb.amazonaws.com/O=AmbientDemo/C=US" \
+    -addext "subjectAltName=DNS:*.elb.amazonaws.com,DNS:*.us-east-1.elb.amazonaws.com,DNS:*.us-west-2.elb.amazonaws.com" \
+    2>/dev/null
 
-  CERT_ARN=$(aws acm request-certificate \
-    --domain-name "${WILDCARD_DOMAIN}" \
-    --subject-alternative-names "${DOMAIN}" "${OPENEMR_DOMAIN}" "${DEMO_DOMAIN}" \
-    --validation-method DNS \
+  CERT_ARN=$(aws acm import-certificate \
+    --certificate fileb://"$CERT_DIR/selfsigned.crt" \
+    --private-key fileb://"$CERT_DIR/selfsigned.key" \
     --region "$REGION" \
+    --tags Key=Purpose,Value=ambient-demo-self-signed \
     --query 'CertificateArn' \
     --output text)
 
-  ok "Certificate requested: $CERT_ARN"
-
-  # Wait for DNS validation records to be available
-  log "Waiting for DNS validation records..."
-  sleep 10
-
-  # Get validation records and create them in Route53
-  VALIDATION_OPTIONS=$(aws acm describe-certificate \
-    --certificate-arn "$CERT_ARN" \
-    --region "$REGION" \
-    --query 'Certificate.DomainValidationOptions[*].ResourceRecord' \
-    --output json 2>/dev/null)
-
-  # Create Route53 validation records
-  CHANGE_BATCH='{"Changes":['
-  FIRST=true
-  while IFS= read -r record; do
-    NAME=$(echo "$record" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['Name'])")
-    VALUE=$(echo "$record" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['Value'])")
-    TYPE=$(echo "$record" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['Type'])")
-
-    if [[ "$FIRST" == "true" ]]; then
-      FIRST=false
-    else
-      CHANGE_BATCH+=','
-    fi
-    CHANGE_BATCH+="{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"${NAME}\",\"Type\":\"${TYPE}\",\"TTL\":300,\"ResourceRecords\":[{\"Value\":\"${VALUE}\"}]}}"
-  done < <(echo "$VALIDATION_OPTIONS" | python3 -c "
-import sys, json
-records = json.load(sys.stdin)
-seen = set()
-for r in records:
-    if r and r['Name'] not in seen:
-        seen.add(r['Name'])
-        print(json.dumps(r))
-")
-  CHANGE_BATCH+=']}'
-
-  aws route53 change-resource-record-sets \
-    --hosted-zone-id "$HOSTED_ZONE_ID" \
-    --change-batch "$CHANGE_BATCH" \
-    --output text >/dev/null 2>&1
-
-  ok "DNS validation records created in Route53"
-
-  # Wait for certificate to be issued
-  log "Waiting for certificate validation (this may take 2-5 minutes)..."
-  aws acm wait certificate-validated \
-    --certificate-arn "$CERT_ARN" \
-    --region "$REGION" 2>/dev/null || {
-    # Retry with longer timeout
-    sleep 30
-    aws acm wait certificate-validated \
-      --certificate-arn "$CERT_ARN" \
-      --region "$REGION" 2>/dev/null || fail "Certificate validation timed out. Check ACM console."
-  }
-
-  ok "Certificate issued and validated: $CERT_ARN"
+  ok "Self-signed certificate imported to ACM: $CERT_ARN"
 fi
+
+# Clean up key material from disk
+rm -rf "$CERT_DIR"
 
 # ─── Step 1: Deploy OpenEMR Stack ────────────────────────────────────────────
 
@@ -260,13 +194,12 @@ if [[ "$SKIP_OPENEMR" == "false" ]]; then
   source .venv/bin/activate
   pip install -r requirements.txt --quiet
 
-  # Deploy with certificate and domain
+  # Deploy with certificate (no Route53 domain — uses ALB DNS directly)
   cdk deploy \
     --context "security_group_ip_range_ipv4=${MY_CIDR}" \
     --context "activate_openemr_apis=true" \
     --context "rds_deletion_protection=false" \
     --context "certificate_arn=${CERT_ARN}" \
-    --context "route53_domain=${DOMAIN}" \
     --require-approval never \
     --region "$REGION" \
     --outputs-file "$SCRIPT_DIR/.openemr-outputs.json" \
@@ -337,25 +270,6 @@ fi
 
 ok "SSM parameters published"
 
-# Update Route53 record for OpenEMR to point to the current ALB
-log "Updating OpenEMR DNS record..."
-OPENEMR_ALB_DNS=$(aws elbv2 describe-load-balancers --region "$REGION" \
-  --query "LoadBalancers[?contains(LoadBalancerName,'Openem')].DNSName" \
-  --output text 2>/dev/null) || true
-OPENEMR_ALB_ZONE=$(aws elbv2 describe-load-balancers --region "$REGION" \
-  --query "LoadBalancers[?contains(LoadBalancerName,'Openem')].CanonicalHostedZoneId" \
-  --output text 2>/dev/null) || true
-
-if [[ -n "$OPENEMR_ALB_DNS" && "$OPENEMR_ALB_DNS" != "None" && -n "$HOSTED_ZONE_ID" ]]; then
-  aws route53 change-resource-record-sets \
-    --hosted-zone-id "$HOSTED_ZONE_ID" \
-    --change-batch "{\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"${OPENEMR_DOMAIN}\",\"Type\":\"A\",\"AliasTarget\":{\"HostedZoneId\":\"${OPENEMR_ALB_ZONE}\",\"DNSName\":\"dualstack.${OPENEMR_ALB_DNS}\",\"EvaluateTargetHealth\":false}}}]}" \
-    --region "$REGION" >/dev/null 2>&1
-  ok "OpenEMR DNS updated: ${OPENEMR_DOMAIN} -> ${OPENEMR_ALB_DNS}"
-else
-  warn "Could not update OpenEMR DNS record"
-fi
-
 # ─── Step 2: Deploy Demo App Stack ───────────────────────────────────────────
 
 echo ""
@@ -384,7 +298,6 @@ cdk deploy \
   --context "allowedCidr=${MY_CIDR}" \
   --context "openemrStackName=OpenEmrStack" \
   --context "certificateArn=${CERT_ARN}" \
-  --context "domain=${DEMO_DOMAIN}" \
   $VPC_CONTEXT \
   $CONNECT_HEALTH_CONTEXT \
   --require-approval never \
@@ -501,68 +414,46 @@ if [[ "$SKIP_DATA_LOAD" == "false" ]]; then
     --output text 2>/dev/null) || true
 
   if [[ -n "$DATA_LOADER_FN" && "$DATA_LOADER_FN" != "None" ]]; then
+    # The handler expects a CloudFormation-style event: RequestType + ResourceProperties.
+    # ForceReload=true ensures a redeploy refreshes data instead of skipping when patients
+    # already exist. SyntheaBucket/SyntheaPrefix point the loader at the uploaded bundles.
     aws lambda invoke \
       --function-name "$DATA_LOADER_FN" \
-      --cli-binary-format raw-in-base64-out \
-      --payload "{\"RequestType\":\"Create\",\"ResourceProperties\":{\"ForceReload\":\"true\",\"SyntheaBucket\":\"$OUTPUT_BUCKET\",\"SyntheaPrefix\":\"synthea-bundles/\"},\"ResponseURL\":\"\",\"StackId\":\"manual\",\"RequestId\":\"manual-deploy\",\"LogicalResourceId\":\"DataLoader\"}" \
       --region "$REGION" \
-      /tmp/data-loader-output.json 2>&1 | tail -3
-    
-    LOADER_RESULT=$(cat /tmp/data-loader-output.json 2>/dev/null)
-    if echo "$LOADER_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('Message','').startswith('Loaded') else 1)" 2>/dev/null; then
-      ok "Data loader completed: $(echo "$LOADER_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Message',''))")"
-    else
-      warn "Data loader returned: $LOADER_RESULT"
+      --cli-binary-format raw-in-base64-out \
+      --payload "{\"RequestType\":\"Create\",\"ResourceProperties\":{\"ForceReload\":\"true\",\"SyntheaBucket\":\"$OUTPUT_BUCKET\",\"SyntheaPrefix\":\"synthea-bundles/\"},\"StackId\":\"manual\",\"RequestId\":\"manual-deploy\",\"LogicalResourceId\":\"DataLoader\"}" \
+      --cli-read-timeout 600 \
+      "$SCRIPT_DIR/.dataloader-response.json" >/dev/null 2>&1 || warn "Data loader invocation returned non-zero (check Lambda logs)"
+
+    if [[ -f "$SCRIPT_DIR/.dataloader-response.json" ]]; then
+      # The handler returns its `data` dict (Message, PatientCount, ...). Success is a
+      # Message beginning with "Loaded" or "Skipped"; anything else is treated as a failure.
+      LOAD_MESSAGE=$(python3 -c "import json; r=json.load(open('$SCRIPT_DIR/.dataloader-response.json')); print(r.get('Message',''))" 2>/dev/null) || true
+      if [[ "$LOAD_MESSAGE" == Loaded* || "$LOAD_MESSAGE" == Skipped* ]]; then
+        ok "Data loader completed: $LOAD_MESSAGE"
+      else
+        warn "Data loader returned: ${LOAD_MESSAGE:-unknown} (check Lambda logs)"
+      fi
+      rm -f "$SCRIPT_DIR/.dataloader-response.json"
+    fi
+
+    # The data loader registers the OAuth client and updates the FHIR credentials secret.
+    # Restart the Demo App so it picks up the updated credentials (it caches them at startup).
+    log "Restarting Demo App to pick up updated FHIR credentials..."
+    DEMO_CLUSTER=$(aws ecs list-clusters --region "$REGION" \
+      --query 'clusterArns[?contains(@,`DemoApp`)]' --output text 2>/dev/null | awk -F/ '{print $NF}')
+    if [[ -n "$DEMO_CLUSTER" ]]; then
+      DEMO_SERVICE=$(aws ecs list-services --cluster "$DEMO_CLUSTER" --region "$REGION" \
+        --query 'serviceArns[0]' --output text 2>/dev/null | awk -F/ '{print $NF}')
+      if [[ -n "$DEMO_SERVICE" && "$DEMO_SERVICE" != "None" ]]; then
+        aws ecs update-service --cluster "$DEMO_CLUSTER" --service "$DEMO_SERVICE" \
+          --force-new-deployment --region "$REGION" >/dev/null 2>&1 \
+          && ok "Demo App restarting with updated credentials" \
+          || warn "Could not restart Demo App service (restart it manually if patients don't appear)"
+      fi
     fi
   else
-    warn "Could not find data loader Lambda function"
-  fi
-
-  # The data loader Lambda registers the OAuth client via direct DB insert
-  # and updates the FHIR credentials secret automatically.
-  # Just verify it worked by checking the secret was updated.
-  log "Verifying OAuth client registration (handled by data loader Lambda)..."
-  FHIR_CREDS_SECRET=$(aws cloudformation describe-stacks --stack-name DemoAppStack --region "$REGION" \
-    --query 'Stacks[0].Outputs[?OutputKey==`FhirApiCredentialsSecretArn`].OutputValue' --output text 2>/dev/null) || true
-
-  if [[ -n "$FHIR_CREDS_SECRET" && "$FHIR_CREDS_SECRET" != "None" ]]; then
-    FHIR_CLIENT_ID=$(aws secretsmanager get-secret-value --secret-id "$FHIR_CREDS_SECRET" --region "$REGION" \
-      --query 'SecretString' --output text 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('clientId',''))" 2>/dev/null) || true
-    if [[ -n "$FHIR_CLIENT_ID" && "$FHIR_CLIENT_ID" != "demo-app-fhir-client" ]]; then
-      ok "OAuth client registered and FHIR credentials secret updated (clientId: ${FHIR_CLIENT_ID:0:20}...)"
-    else
-      warn "FHIR credentials secret may not have been updated by data loader — check Lambda logs"
-    fi
-  fi
-
-  log "Restarting Demo App to pick up new credentials..."
-  DEMO_CLUSTER=$(aws ecs list-clusters --region "$REGION" \
-    --query 'clusterArns[?contains(@,`DemoApp`)]' --output text 2>/dev/null | awk -F/ '{print $NF}')
-  DEMO_SERVICE=$(aws ecs list-services --cluster "$DEMO_CLUSTER" --region "$REGION" \
-    --query 'serviceArns[0]' --output text 2>/dev/null | awk -F/ '{print $NF}')
-  if [[ -n "$DEMO_CLUSTER" && -n "$DEMO_SERVICE" ]]; then
-    aws ecs update-service --cluster "$DEMO_CLUSTER" --service "$DEMO_SERVICE" \
-      --force-new-deployment --region "$REGION" >/dev/null 2>&1
-    ok "Demo App restarting with updated credentials"
-  fi
-
-  # Update Route53 record for Demo App to point to the current ALB
-  log "Updating Demo App DNS record..."
-  DEMO_ALB_DNS=$(aws elbv2 describe-load-balancers --region "$REGION" \
-    --query "LoadBalancers[?contains(LoadBalancerName,'DemoAp')].DNSName" \
-    --output text 2>/dev/null) || true
-  DEMO_ALB_ZONE=$(aws elbv2 describe-load-balancers --region "$REGION" \
-    --query "LoadBalancers[?contains(LoadBalancerName,'DemoAp')].CanonicalHostedZoneId" \
-    --output text 2>/dev/null) || true
-
-  if [[ -n "$DEMO_ALB_DNS" && "$DEMO_ALB_DNS" != "None" && -n "$HOSTED_ZONE_ID" ]]; then
-    aws route53 change-resource-record-sets \
-      --hosted-zone-id "$HOSTED_ZONE_ID" \
-      --change-batch "{\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"${DEMO_DOMAIN}\",\"Type\":\"A\",\"AliasTarget\":{\"HostedZoneId\":\"${DEMO_ALB_ZONE}\",\"DNSName\":\"dualstack.${DEMO_ALB_DNS}\",\"EvaluateTargetHealth\":false}}}]}" \
-      --region "$REGION" >/dev/null 2>&1
-    ok "Demo App DNS updated: ${DEMO_DOMAIN} -> ${DEMO_ALB_DNS}"
-  else
-    warn "Could not update Demo App DNS record"
+    warn "Data loader Lambda not found — skip automatic data loading"
   fi
 else
   log "Skipping data load (--skip-data-load)"
@@ -576,21 +467,27 @@ echo "  Deployment Complete!"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-APP_URL="https://${DEMO_DOMAIN}"
-OPENEMR_URL="https://${OPENEMR_DOMAIN}"
+# Get actual ALB DNS names for display
+DEMO_ALB_URL=$(aws elbv2 describe-load-balancers --region "$REGION" \
+  --query "LoadBalancers[?contains(LoadBalancerName,'DemoAp')].DNSName" \
+  --output text 2>/dev/null) || true
+OPENEMR_ALB_URL=$(aws elbv2 describe-load-balancers --region "$REGION" \
+  --query "LoadBalancers[?contains(LoadBalancerName,'Openem')].DNSName" \
+  --output text 2>/dev/null) || true
 
-echo -e "  ${GREEN}Demo App URL:${NC}     $APP_URL"
-echo -e "  ${GREEN}OpenEMR URL:${NC}      $OPENEMR_URL"
+echo -e "  ${GREEN}Demo App URL:${NC}     https://${DEMO_ALB_URL}"
+echo -e "  ${GREEN}OpenEMR URL:${NC}      https://${OPENEMR_ALB_URL}"
 echo -e "  ${GREEN}Region:${NC}           $REGION"
 echo -e "  ${GREEN}Account:${NC}          $AWS_ACCOUNT"
-echo -e "  ${GREEN}Certificate:${NC}      $CERT_ARN"
+echo -e "  ${GREEN}Certificate:${NC}      $CERT_ARN (self-signed)"
+echo ""
+echo -e "  ${YELLOW}NOTE:${NC} Using self-signed certificate. Browser will show a security warning."
+echo "        Click 'Advanced' → 'Proceed' to access the application."
 echo ""
 echo "  Estimated cost: ~\$0.50-0.65/hr while running"
 echo ""
 echo "  To destroy all resources:"
-echo "    ./destroy.sh --domain $DOMAIN --region $REGION"
+echo "    ./destroy.sh --region $REGION"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-
-# Clean up temp output files
-rm -f "$SCRIPT_DIR/.openemr-outputs.json" "$SCRIPT_DIR/.demoapp-outputs.json"
+echo ""

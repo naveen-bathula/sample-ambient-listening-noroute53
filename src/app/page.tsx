@@ -341,9 +341,17 @@ function AmbientDocumentationContent() {
               Amazon Connect Health + OpenEMR Demo
             </p>
           </div>
-          {(isSessionActive || isStreaming) && (
-            <AudioIndicator isActive={true} source={audioSource} />
-          )}
+          <div className="flex items-center gap-4">
+            {(isSessionActive || isStreaming) && (
+              <AudioIndicator isActive={true} source={audioSource} />
+            )}
+            <a
+              href="/api/auth/logout"
+              className="text-sm font-medium text-gray-500 hover:text-gray-900"
+            >
+              Sign out
+            </a>
+          </div>
         </div>
       </header>
 

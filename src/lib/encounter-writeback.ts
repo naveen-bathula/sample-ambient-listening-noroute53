@@ -16,6 +16,7 @@
  * documentation and shared responsibility model for additional requirements.
  */
 
+import https from 'https';
 import {
   SecretsManagerClient,
   GetSecretValueCommand,
@@ -24,6 +25,17 @@ import mysql from 'mysql2/promise';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const FHIR_BASE_URL = process.env.OPENEMR_FHIR_BASE_URL || '';
+
+// The OpenEMR ALB uses a self-signed certificate (no Route53/ACM DNS-validated cert).
+// When OPENEMR_ALLOW_SELF_SIGNED_TLS is set, relax cert chain verification for these
+// internal service-to-service calls while still enforcing TLS 1.2+.
+const ALLOW_SELF_SIGNED_TLS =
+  (process.env.OPENEMR_ALLOW_SELF_SIGNED_TLS || '').toLowerCase() === 'true';
+const tlsAgent = new https.Agent({
+  minVersion: 'TLSv1.2',
+  keepAlive: true,
+  rejectUnauthorized: !ALLOW_SELF_SIGNED_TLS,
+});
 const FHIR_CREDENTIALS_SECRET = process.env.FHIR_CREDENTIALS_SECRET_NAME || 'DemoAppStack/fhir-api-credentials';
 const DB_SECRET_ARN = process.env.DB_SECRET_ARN || '';
 
@@ -120,6 +132,8 @@ async function getAccessToken(): Promise<string> {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
+    // @ts-expect-error Node.js fetch supports the agent option for https (self-signed ALB cert)
+    agent: tlsAgent,
   });
 
   if (!response.ok) {
@@ -163,6 +177,8 @@ export async function createEncounterWithNote(
       'Accept': 'application/json',
       'Authorization': `Bearer ${token}`,
     },
+    // @ts-expect-error Node.js fetch supports the agent option for https (self-signed ALB cert)
+    agent: tlsAgent,
     body: JSON.stringify({
       date: dateStr,
       reason: 'Ambient Clinical Documentation',
