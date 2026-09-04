@@ -28,12 +28,17 @@ git clone --recurse-submodules https://github.com/<org>/amazon-connect-health-am
 cd amazon-connect-health-ambient
 npm install  # All dependencies use exact version pins in package.json
 
-# Deploy to AWS (requires Route53 hosted zone)
-./deploy.sh --domain your-domain.example.com
+# Deploy to AWS (uses the ALB DNS name with a self-signed certificate — no Route53 required)
+./deploy.sh --connect-health-domain <name>
 
 # Tear down when done
-./destroy.sh --domain your-domain.example.com
+./destroy.sh --region us-east-1
 ```
+
+> **Note:** This deployment is reached via the **ALB DNS name with a self-signed
+> certificate** (no Route 53 / custom domain). Authentication is handled inside the
+> application (Cognito OIDC), and the Amazon Connect Health domain is created
+> manually. See the **[Workshop Guide](docs/WORKSHOP.md)** for the full flow.
 
 For step-by-step manual deployment, see the **[Workshop Guide](docs/WORKSHOP.md)**.
 
@@ -80,30 +85,28 @@ git submodule update --init --recursive
 - AWS CDK CLI 2.150+ (`npm install -g aws-cdk@2.150.0`)
 - AWS CLI 2.15+ configured with appropriate credentials
 - Docker (for CDK asset bundling)
+- `openssl` (for self-signed certificate generation)
 - AWS account with **us-east-1** or **us-west-2** region access
-- **A Route53 hosted zone** for your domain (used for HTTPS certificate creation)
-- **Amazon Connect Health environment** — You must have Amazon Connect Health enabled in your AWS account before deployment. Contact your AWS account team or request access through the AWS console. The service must be available in your target region (us-east-1 or us-west-2).
+- **No Route 53 / custom domain required** — the app is served from the ALB DNS name with a self-signed certificate (browsers show a certificate warning; click **Advanced → Proceed**)
+- **Amazon Connect Health environment** — You must have Amazon Connect Health enabled in your AWS account before deployment. Contact your AWS account team or request access through the AWS console. The service must be available in your target region (us-east-1 or us-west-2). The demo does **not** auto-create the Connect Health domain; you create it manually and point the app at it (see the [Workshop Guide](docs/WORKSHOP.md)).
 
 ## Deploy
 
-Deploy the entire demo with a single command:
+Deploy the entire demo with a single command. No Route 53 hosted zone or custom
+domain is required — the app is served from the ALB DNS name with a self-signed
+certificate.
 
 ```bash
-./deploy.sh --domain <your-route53-domain>
-```
-
-Example:
-```bash
-./deploy.sh --domain hda.example.people.aws.dev
+./deploy.sh --connect-health-domain <name>
 ```
 
 The script will:
-1. Validate prerequisites (tools, credentials, Route53 hosted zone)
-2. Create an ACM wildcard certificate for your domain (DNS-validated automatically)
+1. Validate prerequisites (tools, credentials, Docker, openssl)
+2. Generate a self-signed certificate and import it to ACM
 3. Deploy the OpenEMR stack (~35 min)
 4. Deploy the Demo App stack (~15 min)
 5. Configure database access between stacks
-6. Load 100 synthetic patients with clinical notes (including Margaret Smith demo patient)
+6. Load synthetic patients with clinical notes (including the Margaret Smith demo patient)
 7. Register and enable the OAuth2 API client for EHR write-back
 
 Options:
@@ -111,15 +114,20 @@ Options:
 - `--skip-openemr` — Skip OpenEMR if already deployed
 - `--skip-data-load` — Skip synthetic data loading
 
+After deploying, create the Amazon Connect Health domain and point the app at it —
+see the **[Workshop Guide](docs/WORKSHOP.md)** (section 4). Log in with the demo
+clinician credentials stored in Secrets Manager (`DemoAppStack/clinician-credentials`).
+
 ## Destroy
 
 Remove all resources and stop incurring costs:
 
 ```bash
-./destroy.sh --domain <your-route53-domain>
+./destroy.sh --region us-east-1
 ```
 
-This destroys both CDK stacks, deletes the ACM certificate, and cleans up DNS validation records.
+This destroys both CDK stacks. Also delete any Amazon Connect Health domain you
+created manually (see the [Workshop Guide](docs/WORKSHOP.md), section 7).
 
 ## Security & Compliance
 
