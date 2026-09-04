@@ -523,7 +523,7 @@ export class SessionManager {
    * @see Requirements 4.1
    */
   private async getOrCreateDomain(): Promise<ConnectHealthDomain> {
-    // List existing domains and check for a match by name
+    // List existing domains and check for a match by name.
     const domains = await this.client.listDomains();
     const existingDomain = domains.find(
       (d) => d.domainName === this.config.domainName
@@ -533,8 +533,13 @@ export class SessionManager {
       return existingDomain;
     }
 
-    // Create a new domain if none exists with the configured name
-    return this.client.createDomain(this.config.domainName);
+    // The domain must be created out-of-band (e.g. via the AWS console during a
+    // workshop) and referenced by name through CONNECT_HEALTH_DOMAIN_NAME. We do
+    // NOT create it here; fail with a clear, actionable message instead.
+    throw new Error(
+      `Amazon Connect Health domain "${this.config.domainName}" was not found. ` +
+        `Create it manually and set CONNECT_HEALTH_DOMAIN_NAME on the Demo App ECS task.`
+    );
   }
 
   /**

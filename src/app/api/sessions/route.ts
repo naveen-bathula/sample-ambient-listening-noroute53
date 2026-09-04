@@ -18,7 +18,6 @@ import { validateRegion, validateConfig } from '@/lib/config';
 import {
   ConnectHealthClient,
   ListDomainsCommand,
-  CreateDomainCommand,
   CreateSubscriptionCommand,
 } from '@aws-sdk/client-connecthealth';
 
@@ -54,21 +53,35 @@ export async function POST(request: Request) {
     const region = config.aws.region;
     const client = new ConnectHealthClient({ region });
 
-    // Step 1: Get or create domain
+    // Step 1: Look up the pre-existing Connect Health domain.
+    // The domain must be created out-of-band (e.g. via the AWS console during the
+    // workshop) and its name supplied through the CONNECT_HEALTH_DOMAIN_NAME
+    // environment variable on the ECS task. The application intentionally does NOT
+    // create the domain: if it is missing, we fail with a clear, actionable error
+    // so the operator knows to create it and update the environment variable.
     const domainName = config.connectHealth.domainName;
     let domainId: string;
 
     const listResponse = await client.send(new ListDomainsCommand({}));
     const existingDomain = listResponse.domains?.find(d => d.name === domainName);
 
-    if (existingDomain) {
-      domainId = existingDomain.domainId || '';
-      console.log(`[Sessions] Using existing domain: ${domainId}`);
-    } else {
-      const createResponse = await client.send(new CreateDomainCommand({ name: domainName }));
-      domainId = createResponse.domainId || '';
-      console.log(`[Sessions] Created domain: ${domainId}`);
+    if (!existingDomain) {
+      console.error(`[Sessions] Connect Health domain "${domainName}" not found; not creating it.`);
+      return NextResponse.json(
+        {
+          code: 'DOMAIN_NOT_FOUND',
+          message:
+            `Amazon Connect Health domain "${domainName}" was not found in this account/region. ` +
+            `Create the domain manually (AWS console) and set the CONNECT_HEALTH_DOMAIN_NAME ` +
+            `environment variable on the Demo App ECS task to its name.`,
+          retryable: false,
+        },
+        { status: 400 }
+      );
     }
+
+    domainId = existingDomain.domainId || '';
+    console.log(`[Sessions] Using existing domain: ${domainId}`);
 
     // Step 2: Create subscription
     const subResponse = await client.send(new CreateSubscriptionCommand({ domainId }));
