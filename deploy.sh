@@ -32,6 +32,7 @@ DOMAIN=""
 CONNECT_HEALTH_DOMAIN=""
 SKIP_OPENEMR=false
 SKIP_DATA_LOAD=false
+ALLOWED_CIDR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ─── Parse Arguments ──────────────────────────────────────────────────────────
@@ -41,19 +42,24 @@ while [[ $# -gt 0 ]]; do
     --domain) DOMAIN="$2"; shift 2 ;;
     --connect-health-domain) CONNECT_HEALTH_DOMAIN="$2"; shift 2 ;;
     --region) REGION="$2"; shift 2 ;;
+    --allowed-cidr) ALLOWED_CIDR="$2"; shift 2 ;;
     --skip-openemr) SKIP_OPENEMR=true; shift ;;
     --skip-data-load) SKIP_DATA_LOAD=true; shift ;;
     -h|--help)
-      echo "Usage: ./deploy.sh --connect-health-domain <name> [--region REGION] [--skip-openemr] [--skip-data-load]"
+      echo "Usage: ./deploy.sh --connect-health-domain <name> [--region REGION] [--allowed-cidr CIDR] [--skip-openemr] [--skip-data-load]"
       echo ""
       echo "Required:"
       echo "  --connect-health-domain NAME      Amazon Connect Health domain name (created via console)"
       echo ""
       echo "Options:"
-      echo "  --domain DOMAIN     Optional label (not used for DNS)"
-      echo "  --region REGION     AWS region (default: us-east-1, must be us-east-1 or us-west-2)"
-      echo "  --skip-openemr      Skip OpenEMR stack deployment (if already deployed)"
-      echo "  --skip-data-load    Skip synthetic patient data loading"
+      echo "  --domain DOMAIN       Optional label (not used for DNS)"
+      echo "  --region REGION       AWS region (default: us-east-1, must be us-east-1 or us-west-2)"
+      echo "  --allowed-cidr CIDR   CIDR allowed to reach the ALBs. If omitted, the script"
+      echo "                        auto-detects the caller's public IP (/24). Set this when"
+      echo "                        running non-interactively (e.g. CodeBuild), where the"
+      echo "                        caller IP is not the participant's browser IP."
+      echo "  --skip-openemr        Skip OpenEMR stack deployment (if already deployed)"
+      echo "  --skip-data-load      Skip synthetic patient data loading"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -119,10 +125,18 @@ ok "Node.js $(node --version)"
 AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || fail "AWS credentials not configured. Run: aws configure"
 ok "AWS Account: $AWS_ACCOUNT"
 
-# Get caller IP for security group (use /24 to handle IP variance within the same network)
-MY_IP=$(curl -s --max-time 5 https://checkip.amazonaws.com 2>/dev/null) || fail "Could not determine your public IP"
-MY_CIDR="${MY_IP%.*}.0/24"
-ok "Your IP: $MY_IP (allowing ${MY_CIDR})"
+# Determine the CIDR allowed to reach the ALBs.
+# If --allowed-cidr was supplied (e.g. in CodeBuild, where the caller IP is the
+# build container's egress IP, not the participant's browser), use it verbatim.
+# Otherwise auto-detect the caller's public IP and allow its /24.
+if [[ -n "$ALLOWED_CIDR" ]]; then
+  MY_CIDR="$ALLOWED_CIDR"
+  ok "Allowed CIDR (explicit): ${MY_CIDR}"
+else
+  MY_IP=$(curl -s --max-time 5 https://checkip.amazonaws.com 2>/dev/null) || fail "Could not determine your public IP"
+  MY_CIDR="${MY_IP%.*}.0/24"
+  ok "Your IP: $MY_IP (allowing ${MY_CIDR})"
+fi
 
 # Check CDK bootstrap
 aws cloudformation describe-stacks --stack-name CDKToolkit --region "$REGION" --query 'Stacks[0].StackStatus' --output text >/dev/null 2>&1 || {

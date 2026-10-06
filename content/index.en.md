@@ -62,11 +62,15 @@ real PHI in production.
 Work through the modules in order using the navigation on the left:
 
 1. **Introduction** – what ambient documentation is and how the app is built.
-2. **Prerequisites & Setup** – confirm your environment and tools.
-3. **Deploy the Environment** – stand up OpenEMR and the demo app.
-4. **Explore the EHR** – log in to OpenEMR and find your patient.
-5. **Run Ambient Documentation** – stream a conversation and watch it transcribe.
-6. **Review the SOAP Note** – edit, approve, and write back to the chart.
-7. **Clean Up** – tear everything down so you stop incurring cost.
+2. **Prerequisites & Setup** – confirm which account path you are on and your tools.
+3. **Access Your Environment** – in a provided account it is already deployed; in
+   your own account you deploy it with one command.
+4. **Explore the EHR** – log in to OpenEMR, find your patient, and confirm the
+   environment is healthy.
+5. **Create Your Connect Health Domain** – create the `ambient-workshop` domain
+   the app uses for transcription.
+6. **Run Ambient Documentation** – stream a conversation and watch it transcribe.
+7. **Review the SOAP Note** – edit, approve, and write back to the chart.
+8. **Clean Up** – tear everything down so you stop incurring cost.
 
 Let's get started.

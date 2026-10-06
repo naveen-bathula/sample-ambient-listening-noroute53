@@ -1,0 +1,81 @@
+version: 2.0
+
+defaultLocaleCode: en-US
+localeCodes:
+  - en-US
+
+additionalLinks:
+  - title: Amazon Connect Health
+    link: https://aws.amazon.com/connect/health/
+  - title: OpenEMR
+    link: https://www.open-emr.org/
+  - title: Workshop source repository (aws-samples)
+    link: https://github.com/aws-samples/sample-ambient-listening-demo
+
+awsAccountConfig:
+  # This workshop supports BOTH account models:
+  #   - WorkshopStudio : Workshop Studio provisions a temporary AWS account per
+  #                      participant/team and runs the bootstrap template below,
+  #                      which deploys the whole environment before the
+  #                      participant logs in.
+  #   - CustomerProvided : Participants bring their own AWS account and run the
+  #                        deploy themselves (see the Prerequisites module).
+  # An event operator picks one (or allows a mix) when they create the event.
+  accountSources:
+    - WorkshopStudio
+    - CustomerProvided
+
+  # Permissions granted to the ParticipantRole that attendees assume in a
+  # Workshop Studio provisioned account. In the provisioned-account model the
+  # environment is already deployed by the bootstrap template (below), so the
+  # participant only needs to explore OpenEMR, create an Amazon Connect Health
+  # domain, and use the running app — NOT run a CDK deploy. The policy is scoped
+  # accordingly.
+  participantRole:
+    iamPolicies:
+      - static/iam-policy.json
+
+  # No EC2 key pair is required.
+  ec2KeyPair: false
+
+  # Amazon Connect Health is only available in us-east-1 and us-west-2. The
+  # event operator chooses one of these regions.
+  regionConfiguration:
+    minAccessibleRegions: 1
+    maxAccessibleRegions: 1
+    accessibleRegions:
+      recommended:
+        - us-east-1
+        - us-west-2
+    deployableRegions:
+      recommended:
+        - us-east-1
+        - us-west-2
+
+# For WorkshopStudio-provided accounts, this template runs at provisioning time.
+# It stands up a CodeBuild project that clones the aws-samples repo and runs
+# deploy.sh end-to-end (OpenEMR + demo app + synthetic data) INSIDE the leased
+# account, so the environment is ready before the participant arrives. The
+# actual ~45-60 minute Docker/CDK deploy happens inside CodeBuild (privileged
+# mode, 120-minute timeout), which is why this fits Workshop Studio's
+# CloudFormation-based provisioning even though deploy.sh itself needs Docker.
+#
+# CustomerProvided accounts do NOT get this template — those participants run
+# deploy.sh themselves (covered in the Prerequisites and the self-paced notes).
+infrastructure:
+  cloudformationTemplates:
+    - templateLocation: static/bootstrap.yaml
+      label: Ambient Documentation Environment Bootstrap
+      parameters:
+        # Public https git URL of the repo that holds this workshop's deploy.sh
+        # (+ OpenEMR/Synthea submodules). CodeBuild clones it anonymously.
+        - templateParameter: SourceRepoUrl
+          defaultValue: "https://github.com/naveen-bathula/sample-ambient-listening-noroute53.git"
+        - templateParameter: SourceRepoBranch
+          defaultValue: main
+        - templateParameter: DeployRegion
+          defaultValue: us-east-1
+        - templateParameter: ConnectHealthDomainName
+          defaultValue: ambient-workshop
+        - templateParameter: AllowedCidr
+          defaultValue: 0.0.0.0/0

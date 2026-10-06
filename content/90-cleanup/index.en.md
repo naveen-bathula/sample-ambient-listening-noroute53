@@ -5,17 +5,49 @@ weight: 90
 
 # Clean Up
 
-To stop incurring cost, tear down everything you deployed. This step is
-important even in a Workshop Studio provided account, and essential if you
-deployed in your own account.
+How you clean up depends on your account path, but **everyone** should delete the
+Amazon Connect Health domain they created.
+
+- **Path A — Workshop Studio provided account:** when the event ends, Workshop
+  Studio reclaims the account and all its resources automatically. You do not
+  need to run the destroy script. Still, if you created the Connect Health domain
+  and your event runs long, delete it (below) to avoid any domain-related cost.
+- **Path B — Bring your own account:** you must tear everything down yourself —
+  both the deployed stacks (destroy script) **and** the Connect Health domain.
 
 {{% notice warning %}}
-Skipping cleanup leaves ECS Fargate, Aurora, ElastiCache, and load balancers
-running, which continue to bill at roughly **$0.50–0.65 per hour**. Always run
-cleanup when you finish.
+In your own account, skipping cleanup leaves ECS Fargate, Aurora, ElastiCache,
+and load balancers running, which continue to bill at roughly **$0.50–0.65 per
+hour**. Always run cleanup when you finish.
 {{% /notice %}}
 
-## Run the destroy script
+## Delete the Connect Health domain (both paths)
+
+The `ambient-workshop` domain is not part of the CloudFormation stacks, so the
+destroy script does not remove it. Delete it explicitly. Subscriptions must be
+deactivated first.
+
+```bash
+REGION=us-east-1   # match your deployment region
+
+# Find the domain ID
+DID=$(aws health-agent list-domains --region "$REGION" \
+  --query "domains[?name=='ambient-workshop'].domainId" --output text)
+
+# Deactivate any subscriptions under it
+for SUB in $(aws health-agent list-subscriptions --domain-id "$DID" --region "$REGION" \
+    --query 'subscriptions[].subscriptionId' --output text); do
+  aws health-agent deactivate-subscription --domain-id "$DID" --subscription-id "$SUB" --region "$REGION"
+done
+
+# Delete the domain
+aws health-agent delete-domain --domain-id "$DID" --region "$REGION"
+```
+
+You can also delete the domain from the **Amazon Connect Health** console under
+**Domains**.
+
+## Run the destroy script (Path B only)
 
 From the root of the workshop repository, run:
 

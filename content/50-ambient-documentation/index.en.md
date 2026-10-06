@@ -9,6 +9,12 @@ This is the core of the workshop. You will act as the clinician: select a
 patient, stream a clinical conversation to Amazon Connect Health, and watch a
 real-time transcript build with speaker labels.
 
+{{% notice info %}}
+This module uses the **`ambient-workshop`** Connect Health domain you created in
+the previous module. If you skipped that step, starting a session will fail with
+`DOMAIN_NOT_FOUND` — go back and create the domain first.
+{{% /notice %}}
+
 ## Open the demo application
 
 1. Open the **Demo App URL** from the deployment summary in your browser.

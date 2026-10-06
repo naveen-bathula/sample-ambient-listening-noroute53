@@ -5,30 +5,69 @@ weight: 20
 
 # Prerequisites & Setup
 
-Before deploying, make sure your environment has everything the deployment
-scripts need. If you are running in a **Workshop Studio provided account**, the
-AWS account, credentials, and region are already set up for you — you only need
-to confirm the tools below are available in your workshop terminal (Cloud9,
-CloudShell, or your laptop).
+This workshop can be run two ways. Your path determines what you need to set up.
 
-## AWS account and region
+## Choose your path
 
-- An AWS account with permission to create ECS, VPC, RDS/Aurora, S3, ACM, IAM,
-  and Secrets Manager resources.
-- Your region must be **us-east-1** or **us-west-2**. Amazon Connect Health is
-  only available in these regions, and the deploy script enforces this.
-- **Amazon Connect Health must be enabled** in the account and region, and you
-  must have a Connect Health **domain name** ready. If you do not have one, create
-  it in the AWS console before you deploy (you will pass its name to the deploy
-  script).
+| Path | Who it is for | How the environment is deployed |
+|------|---------------|---------------------------------|
+| **A — Workshop Studio provided account** | Attendees at an instructor-led event using accounts handed out by Workshop Studio. | **Automatically, for you.** When your account is provisioned, a bootstrap process deploys the whole environment. You do not run any deployment or install any tools. |
+| **B — Bring your own account** | Self-paced learners, or events where you use your own AWS account. | **You run it yourself** with a single script, so you need a few local tools. |
+
+The hands-on part of the workshop (explore the EHR → create a Connect Health
+domain → run ambient documentation → review the note) is **identical** for both
+paths. Only how you get a running environment differs.
+
+---
+
+## Path A — Workshop Studio provided account
+
+There is almost nothing to set up — the environment deploys itself.
+
+1. Open the event's **Get started** page and choose **Open AWS Console**. This
+   signs you in to the temporary account provisioned for you.
+2. Note the **region** your facilitator specifies (`us-east-1` or `us-west-2`).
+   Everything in this workshop happens in that one region.
+3. That is it. The deployment runs in the background (an AWS CodeBuild project
+   that stands up OpenEMR, the demo app, and synthetic data). You will confirm it
+   has finished in the next module.
 
 {{% notice info %}}
-In a Workshop Studio event, your facilitator will tell you whether Connect
-Health is pre-enabled and provide the domain name to use. If so, skip the manual
-creation step.
+You do **not** need Docker, the AWS CDK, Node, Java, or a local clone of the
+repository on Path A. Those are only needed to *run* the deployment, which
+Workshop Studio does for you. A browser and the AWS console are enough.
 {{% /notice %}}
 
-## Required tools
+{{% notice warning %}}
+The provisioned account is **temporary** and is reclaimed when the event ends.
+Do not store anything you want to keep.
+{{% /notice %}}
+
+Skip ahead to the **AWS credentials** check below, then go to
+**Access Your Environment**.
+
+---
+
+## Path B — Bring your own account
+
+You will run the deployment yourself, so you need an account, credentials, and a
+few tools.
+
+### Account and region
+
+- An AWS account where you have permission to create ECS, VPC, RDS/Aurora,
+  ElastiCache, EFS, S3, ACM, Lambda, Cognito, IAM, Secrets Manager, and KMS
+  resources (effectively administrator-level for this deployment).
+- Credentials configured locally so that `aws sts get-caller-identity` works.
+- A region of **us-east-1** or **us-west-2** — Amazon Connect Health is only
+  available in these two regions, and the deploy script enforces this.
+
+{{% notice info %}}
+Running in your own account incurs AWS charges (roughly **$0.50–0.65/hour**
+while the environment is live). Complete the **Clean Up** module when you finish.
+{{% /notice %}}
+
+### Required tools (Path B only)
 
 Confirm each of these is installed. Run the version check next to each one.
 
@@ -49,28 +88,20 @@ If the CDK CLI is missing, install the pinned version:
 npm install -g aws-cdk@2.150.0
 ```
 
-{{% notice note %}}
-**Java** is required because the workshop generates synthetic patients with
-Synthea, which runs on the JVM. **Docker** must be running because the CDK
-bundles container assets during deployment.
+{{% notice warning %}}
+**Docker must be running at deploy time, and AWS CloudShell does not provide a
+Docker daemon.** Run the deployment from a machine where `docker info` succeeds —
+your laptop, an EC2 instance, or an AWS Cloud9 environment with Docker. **Java**
+is required because the workshop generates synthetic patients with Synthea.
 {{% /notice %}}
 
-## Verify your AWS credentials
-
-Confirm your CLI can reach your account:
-
-```bash
-aws sts get-caller-identity
-```
-
-You should see your account ID, user/role ARN, and user ID returned as JSON.
-
-## Get the workshop code
+### Get the workshop code (Path B only)
 
 Clone the repository **with submodules** (it pulls in OpenEMR and Synthea):
 
 ```bash
-git clone --recurse-submodules <workshop-repo-url> ambient-workshop
+git clone --recurse-submodules \
+  https://github.com/aws-samples/sample-ambient-listening-demo.git ambient-workshop
 cd ambient-workshop
 npm install
 ```
@@ -81,14 +112,16 @@ If you already cloned without submodules, initialize them now:
 git submodule update --init --recursive
 ```
 
-## Bootstrap CDK (first time only)
+---
 
-If this account and region have never been used with the AWS CDK, bootstrap it.
-The deploy script does this automatically if needed, but you can run it ahead of
-time:
+## Verify your AWS credentials (both paths)
+
+Confirm your CLI can reach your account:
 
 ```bash
-cdk bootstrap
+aws sts get-caller-identity
 ```
 
-When every check above passes, continue to **Deploy the Environment**.
+You should see your account ID, user/role ARN, and user ID returned as JSON.
+
+When this passes, continue to **Access Your Environment**.

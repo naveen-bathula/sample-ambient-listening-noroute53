@@ -406,12 +406,13 @@ export class DemoAppStack extends cdk.Stack {
       resources: ['*'],
     }));
 
-    // Connect Health mutating actions scoped to the specific domain
+    // Connect Health subscription creation, scoped to the account's domains.
+    // The app does NOT create domains (participants create the domain by name
+    // out-of-band); it only creates a subscription under an existing domain.
     this.ecsTaskRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'ConnectHealthDomainMutationAccess',
+      sid: 'ConnectHealthSubscriptionCreateAccess',
       effect: iam.Effect.ALLOW,
       actions: [
-        'health-agent:CreateDomain',
         'health-agent:CreateSubscription',
       ],
       resources: [

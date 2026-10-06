@@ -7,6 +7,9 @@ weight: 40
 
 Before running the ambient documentation flow, take a moment to see the patient
 record the way a clinician would — in OpenEMR, the electronic health record.
+This module doubles as your **environment check**: logging in and finding the
+demo patient confirms that OpenEMR deployed correctly and the synthetic data
+loaded, before you move on to create the Amazon Connect Health domain.
 
 ## Open OpenEMR
 
@@ -38,7 +41,13 @@ encounter note** written back to this same record.
 
 This step shows the "before" state. The value of ambient documentation is that
 the clinician can have a natural conversation with the patient and end up with a
-structured note in this record — without manually typing it. In the next module
-you will produce exactly that.
+structured note in this record — without manually typing it. You will produce
+exactly that shortly.
 
-Continue to **Run Ambient Documentation**.
+## Environment check complete
+
+If you were able to log in to OpenEMR and open Margaret Smith's chart, your EHR
+and its synthetic data are working. The last piece the application needs is an
+**Amazon Connect Health domain** — which you will create next.
+
+Continue to **Create Your Connect Health Domain**.

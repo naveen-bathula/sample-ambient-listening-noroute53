@@ -270,7 +270,6 @@ export interface StartSessionResponse {
  */
 export interface ConnectHealthClient {
   listDomains(): Promise<ConnectHealthDomain[]>;
-  createDomain(domainName: string): Promise<ConnectHealthDomain>;
   createSubscription(domainId: string): Promise<ConnectHealthSubscription>;
   startMedicalScribeListeningSession(params: StartSessionParams): Promise<StartSessionResponse>;
   endSession(sessionId: string): Promise<void>;

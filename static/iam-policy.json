@@ -1,0 +1,51 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectHealthManageDomain",
+      "Effect": "Allow",
+      "Action": [
+        "health-agent:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadOnlyExploreEnvironment",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:Describe*",
+        "cloudformation:List*",
+        "cloudformation:Get*",
+        "ecs:Describe*",
+        "ecs:List*",
+        "elasticloadbalancing:Describe*",
+        "rds:Describe*",
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation",
+        "ssm:DescribeParameters",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "secretsmanager:ListSecrets",
+        "logs:Describe*",
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents",
+        "cognito-idp:Describe*",
+        "cognito-idp:List*",
+        "ec2:Describe*",
+        "codebuild:BatchGetProjects",
+        "codebuild:ListBuildsForProject",
+        "codebuild:BatchGetBuilds"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RetrieveWorkshopSecrets",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:*:*:secret:DemoAppStack*"
+    }
+  ]
+}

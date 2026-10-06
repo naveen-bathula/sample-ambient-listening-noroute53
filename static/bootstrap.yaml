@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Ambient Clinical Documentation workshop — account bootstrap. Provisions a
+  CodeBuild project that runs the repo's deploy.sh end-to-end (OpenEMR + demo
+  app + synthetic data) inside this account, so the environment is ready before
+  the participant logs in. Started once at stack-create time via a custom
+  resource. DEMO ONLY: deploys with a self-signed certificate and opens the
+  application load balancers to 0.0.0.0/0 (the app is still gated by Cognito
+  login and uses synthetic data only).
+
+Parameters:
+  SourceRepoUrl:
+    Type: String
+    Default: "https://github.com/naveen-bathula/sample-ambient-listening-noroute53.git"
+    Description: >
+      PUBLIC https git URL of the repository that contains THIS workshop's
+      deploy.sh (the one that accepts --allowed-cidr) and the OpenEMR/Synthea
+      submodules. CodeBuild clones it anonymously, so it MUST be public. (The
+      two submodules point at public upstream repos and clone without
+      credentials.)
+  SourceRepoBranch:
+    Type: String
+    Default: main
+    Description: Branch of the source repository to deploy.
+  ConnectHealthDomainName:
+    Type: String
+    Default: ambient-workshop
+    Description: >
+      The Amazon Connect Health domain name baked into the deployed app. The
+      participant creates a domain with THIS EXACT name during the workshop; the
+      app matches it by name at runtime, so no redeploy is needed afterwards.
+  DeployRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+    Description: Region to deploy into (Amazon Connect Health supported regions only).
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR allowed to reach the application/OpenEMR load balancers. Defaults to
+      0.0.0.0/0 for a pre-provisioned demo (CodeBuild cannot know the
+      participant's browser IP). Narrow this for a more restricted deployment.
+
+Resources:
+  # ─── CodeBuild service role ────────────────────────────────────────────────
+  # Broad permissions: this role runs `cdk bootstrap` and two full CDK deploys
+  # (OpenEMR + demo app) in a freshly leased account. Scope is the whole account
+  # by design — it is a throwaway workshop account.
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deploy-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: FullDeployAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - ecs:*
+                  - elasticloadbalancing:*
+                  - rds:*
+                  - elasticache:*
+                  - elasticfilesystem:*
+                  - ec2:*
+                  - application-autoscaling:*
+                  - autoscaling:*
+                  - ecr:*
+                  - s3:*
+                  - acm:*
+                  - secretsmanager:*
+                  - ssm:*
+                  - kms:*
+                  - lambda:*
+                  - logs:*
+                  - cloudwatch:*
+                  - events:*
+                  - cognito-idp:*
+                  - cognito-identity:*
+                  - iam:*
+                  - sts:*
+                  - health-agent:*
+                Resource: "*"
+
+  # ─── CodeBuild project ─────────────────────────────────────────────────────
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-ambient-deploy"
+      Description: Runs deploy.sh to stand up the ambient documentation environment.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 120
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        # Privileged mode is REQUIRED: deploy.sh builds Docker images at CDK
+        # synth time (the Next.js app image and the data-loader Lambda bundle).
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: DEPLOY_REGION
+            Value: !Ref DeployRegion
+          - Name: CONNECT_HEALTH_DOMAIN_NAME
+            Value: !Ref ConnectHealthDomainName
+          - Name: ALLOWED_CIDR
+            Value: !Ref AllowedCidr
+          - Name: SOURCE_REPO_URL
+            Value: !Ref SourceRepoUrl
+          - Name: SOURCE_REPO_BRANCH
+            Value: !Ref SourceRepoBranch
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+                python: 3.11
+                java: corretto17
+              commands:
+                - echo "Installing AWS CDK 2.150.0..."
+                - npm install -g aws-cdk@2.150.0
+                - cdk --version
+            build:
+              commands:
+                - |
+                  if [ "$SOURCE_REPO_URL" = "REPLACE_ME" ]; then
+                    echo "ERROR: SourceRepoUrl is not set. Set it to the PUBLIC https git URL"
+                    echo "of the repository containing this workshop's deploy.sh before"
+                    echo "creating the event."
+                    exit 1
+                  fi
+                - echo "Cloning $SOURCE_REPO_URL ($SOURCE_REPO_BRANCH) with submodules..."
+                - git clone --recurse-submodules --branch "$SOURCE_REPO_BRANCH" "$SOURCE_REPO_URL" workshop
+                - cd workshop
+                - npm install
+                - chmod +x deploy.sh
+                - echo "Running deploy.sh unattended..."
+                - ./deploy.sh --connect-health-domain "$CONNECT_HEALTH_DOMAIN_NAME" --region "$DEPLOY_REGION" --allowed-cidr "$ALLOWED_CIDR"
+            post_build:
+              commands:
+                - echo "Deploy finished with status $CODEBUILD_BUILD_SUCCEEDING"
+
+  # ─── Custom resource that starts the build at provisioning time ────────────
+  StartBuildFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                Resource: !GetAtt DeployProject.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  StartBuildFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      Role: !GetAtt StartBuildFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+
+          def send(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch log {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode("utf-8")
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              # Only start the deploy on stack CREATE. On UPDATE/DELETE, do nothing
+              # (the environment is torn down with the account / destroy.sh).
+              try:
+                  if event["RequestType"] == "Create":
+                      cb = boto3.client("codebuild")
+                      project = event["ResourceProperties"]["ProjectName"]
+                      cb.start_build(projectName=project)
+                  send(event, context, "SUCCESS")
+              except Exception as e:
+                  send(event, context, "FAILED", str(e))
+
+  StartBuild:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt StartBuildFunction.Arn
+      ProjectName: !Ref DeployProject
+
+Outputs:
+  CodeBuildProjectName:
+    Description: Name of the CodeBuild project running the environment deploy.
+    Value: !Ref DeployProject
+  ConnectHealthDomainName:
+    Description: >
+      The Connect Health domain name the participant must create (exact match).
+    Value: !Ref ConnectHealthDomainName

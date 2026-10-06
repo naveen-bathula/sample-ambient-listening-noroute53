@@ -16,7 +16,6 @@
 
 import {
   ConnectHealthClient as SDKConnectHealthClient,
-  CreateDomainCommand,
   CreateSubscriptionCommand,
   ListDomainsCommand,
   StartMedicalScribeListeningSessionCommand,
@@ -85,22 +84,6 @@ export function createRealConnectHealthClient(
         domainName: d.name || '', // SDK uses 'name' field
         status: d.status || 'UNKNOWN',
       }));
-    },
-
-    /**
-     * Creates a new domain for ambient documentation.
-     * Returns the domain ID and status.
-     */
-    async createDomain(domainName: string): Promise<ConnectHealthDomain> {
-      const response = await sdkClient.send(
-        new CreateDomainCommand({ name: domainName })
-      );
-
-      return {
-        domainId: response.domainId || '',
-        domainName: response.name || domainName,
-        status: 'ACTIVE',
-      };
     },
 
     /**
