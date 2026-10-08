@@ -33,9 +33,12 @@
         "cognito-idp:Describe*",
         "cognito-idp:List*",
         "ec2:Describe*",
+        "codebuild:ListProjects",
+        "codebuild:ListBuilds",
         "codebuild:BatchGetProjects",
         "codebuild:ListBuildsForProject",
-        "codebuild:BatchGetBuilds"
+        "codebuild:BatchGetBuilds",
+        "codebuild:BatchGetBuildBatches"
       ],
       "Resource": "*"
     },

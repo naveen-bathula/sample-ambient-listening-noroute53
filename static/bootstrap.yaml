@@ -130,8 +130,16 @@ Resources:
             Value: !Ref SourceRepoBranch
       Source:
         Type: NO_SOURCE
+        # The buildspec signals CloudFormation itself (in post_build), so the
+        # bootstrap stack stays CREATE_IN_PROGRESS for the entire deploy and only
+        # reaches CREATE_COMPLETE once deploy.sh has actually finished. This is
+        # what makes Workshop Studio hold the account as "provisioning" until the
+        # HDA (OpenEMR + demo app) environment is really up.
         BuildSpec: |
           version: 0.2
+          env:
+            variables:
+              CFN_WAIT_HANDLE_URL: ""
           phases:
             install:
               runtime-versions:
@@ -160,7 +168,39 @@ Resources:
                 - ./deploy.sh --connect-health-domain "$CONNECT_HEALTH_DOMAIN_NAME" --region "$DEPLOY_REGION" --allowed-cidr "$ALLOWED_CIDR"
             post_build:
               commands:
-                - echo "Deploy finished with status $CODEBUILD_BUILD_SUCCEEDING"
+                # Signal the CloudFormation WaitCondition with the real deploy
+                # outcome. Runs on BOTH success and failure
+                # ($CODEBUILD_BUILD_SUCCEEDING: 1=success, 0=failure), so the stack
+                # only reaches CREATE_COMPLETE once HDA is actually up — and FAILS
+                # the stack if deploy.sh failed, rather than handing over a broken
+                # account.
+                - |
+                  if [ -z "$CFN_WAIT_HANDLE_URL" ]; then
+                    echo "No CFN_WAIT_HANDLE_URL provided; skipping WaitCondition signal."
+                    exit 0
+                  fi
+                  if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+                    STATUS="SUCCESS"; REASON="HDA environment deployed by CodeBuild build $CODEBUILD_BUILD_ID"
+                  else
+                    STATUS="FAILURE"; REASON="deploy.sh failed in CodeBuild build $CODEBUILD_BUILD_ID. See the build log."
+                  fi
+                  echo "Signalling WaitCondition: $STATUS"
+                  python3 - "$CFN_WAIT_HANDLE_URL" "$STATUS" "$REASON" "$CODEBUILD_BUILD_ID" <<'PY'
+                  import json, sys, urllib.request
+                  url, status, reason, build_id = sys.argv[1:5]
+                  # WaitCondition signal shape: Status (SUCCESS|FAILURE), Reason,
+                  # UniqueId, Data.
+                  body = json.dumps({
+                      "Status": status,
+                      "Reason": reason,
+                      "UniqueId": build_id,
+                      "Data": reason,
+                  }).encode("utf-8")
+                  req = urllib.request.Request(url, data=body, method="PUT",
+                      headers={"content-type": "", "content-length": str(len(body))})
+                  urllib.request.urlopen(req)
+                  print("WaitCondition signalled:", status)
+                  PY
 
   # ─── Custom resource that starts the build at provisioning time ────────────
   StartBuildFunctionRole:
@@ -219,13 +259,23 @@ Resources:
               urllib.request.urlopen(req)
 
           def handler(event, context):
-              # Only start the deploy on stack CREATE. On UPDATE/DELETE, do nothing
-              # (the environment is torn down with the account / destroy.sh).
+              # CREATE: start the CodeBuild deploy, passing it the WaitCondition
+              # handle URL. The BUILD signals that handle when deploy.sh finishes;
+              # the separate WaitCondition resource is what holds the stack in
+              # CREATE_IN_PROGRESS until HDA is actually up. This custom resource
+              # only needs to confirm the build was STARTED.
+              # UPDATE/DELETE: nothing to do.
               try:
                   if event["RequestType"] == "Create":
                       cb = boto3.client("codebuild")
                       project = event["ResourceProperties"]["ProjectName"]
-                      cb.start_build(projectName=project)
+                      wait_handle = event["ResourceProperties"]["WaitHandleUrl"]
+                      cb.start_build(
+                          projectName=project,
+                          environmentVariablesOverride=[
+                              {"name": "CFN_WAIT_HANDLE_URL", "value": wait_handle, "type": "PLAINTEXT"},
+                          ],
+                      )
                   send(event, context, "SUCCESS")
               except Exception as e:
                   send(event, context, "FAILED", str(e))
@@ -235,6 +285,23 @@ Resources:
     Properties:
       ServiceToken: !GetAtt StartBuildFunction.Arn
       ProjectName: !Ref DeployProject
+      WaitHandleUrl: !Ref DeployWaitHandle
+
+  # WaitConditionHandle: the build PUTs its success/failure signal here.
+  DeployWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  # WaitCondition: blocks stack CREATE_COMPLETE until the CodeBuild deploy
+  # signals the handle (or the timeout elapses). This is what makes Workshop
+  # Studio treat the account as still provisioning until HDA is fully deployed.
+  # Timeout 5400s (90 min) gives deploy.sh (~45-60 min) comfortable headroom.
+  DeployWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: StartBuild
+    Properties:
+      Handle: !Ref DeployWaitHandle
+      Timeout: "5400"
+      Count: 1
 
 Outputs:
   CodeBuildProjectName:
